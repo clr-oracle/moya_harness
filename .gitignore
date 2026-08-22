@@ -1,3 +1,5 @@
+.DS_Store
+/logs
 /_build
 /cover
 /deps

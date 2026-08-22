@@ -5,6 +5,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${(%):-%N}")" && pwd)"
 HARNESS_ROOT="${HARNESS_ROOT:-$(cd -- "${SCRIPT_DIR}/.." && pwd)}"
 WORKSPACE_ROOT="$(cd -- "${HARNESS_ROOT}/.." && pwd)"
+source "${HARNESS_ROOT}/scripts/results_helpers.sh"
+
 SQUEEZER_REPO="${SQUEEZER_REPO:-${WORKSPACE_ROOT}/moya_squeezer}"
 NETWORK_NAME="${NETWORK_NAME:-moya_net}"
 
@@ -12,6 +14,8 @@ RPS_CONFIG="${HARNESS_ROOT}/harness.rps.config.toml"
 CONCURRENCY_CONFIG="${HARNESS_ROOT}/harness.concurrency.config.toml"
 PAYLOAD_CONFIG="${HARNESS_ROOT}/harness.payload.config.toml"
 COMPOUND_LOG_DIR="${COMPOUND_LOG_DIR:-${HARNESS_ROOT}/logs/compound}"
+RUN_TIMESTAMP="$(results_timestamp)"
+RESULTS_FILE="$(results_file_path "$HARNESS_ROOT" "$RUN_TIMESTAMP")"
 
 mkdir -p "$COMPOUND_LOG_DIR"
 
@@ -38,7 +42,25 @@ extract_top_concurrency() {
       if (val > max) max = val
     }
   } END { print max + 0 }' "$log_file")"
-  from_table="$(awk -F'\t' '/^\[manager\]\[workers\] worker[0-9]+@worker[0-9]+/ { if ($2 + 0 > max) max = $2 + 0 } END { if (max == "") max = 0; print max }' "$log_file")"
+  from_table="$(awk -F'\t' '
+    /^\[manager\]\[workers\] workers\tconcurrency\trequests\tavg_rps$/ {
+      if (in_block && current_sum > max) max = current_sum
+      in_block = 1
+      current_sum = 0
+      next
+    }
+
+    /^\[manager\]\[workers\] worker[0-9]+@worker[0-9]+/ {
+      if (in_block) current_sum += ($2 + 0)
+      next
+    }
+
+    END {
+      if (in_block && current_sum > max) max = current_sum
+      if (max == "") max = 0
+      print max
+    }
+  ' "$log_file")"
   if (( from_ramp > from_table )); then
     echo "$from_ramp"
   else
@@ -131,7 +153,8 @@ upsert_toml_key() {
   local file="$1"
   local key="$2"
   local value="$3"
-  local tmp="${file}.tmp"
+  local tmp
+  tmp="$(mktemp "${file}.XXXXXX")"
 
   awk -v target_key="$key" -v target_value="$value" '
     BEGIN { updated = 0 }
@@ -141,11 +164,15 @@ upsert_toml_key() {
       sub(/#.*/, "", no_comment)
       gsub(/^[ \t]+|[ \t]+$/, "", no_comment)
 
-      line_key = no_comment
-      sub(/=.*/, "", line_key)
-      gsub(/^[ \t]+|[ \t]+$/, "", line_key)
-      if (line_key ~ /^".*"$/) {
-        line_key = substr(line_key, 2, length(line_key) - 2)
+      if (!updated && index(no_comment, "=") > 0) {
+        line_key = no_comment
+        sub(/=.*/, "", line_key)
+        gsub(/^[ \t]+|[ \t]+$/, "", line_key)
+        if (line_key ~ /^".*"$/) {
+          line_key = substr(line_key, 2, length(line_key) - 2)
+        }
+      } else {
+        line_key = ""
       }
 
       if (!updated && line_key == target_key) {
@@ -161,6 +188,50 @@ upsert_toml_key() {
   ' "$file" > "$tmp"
 
   mv "$tmp" "$file"
+}
+
+validate_effective_squeeze_config() {
+  local effective_rel="$1"
+  local validator_name="compound_config_validator_$$"
+
+  docker rm -f "$validator_name" >/dev/null 2>&1 || true
+
+  docker run --rm \
+    --name "$validator_name" \
+    --hostname "$validator_name" \
+    --network "$NETWORK_NAME" \
+    -v "${SQUEEZER_REPO}/config:/app/config:ro" \
+    "moya_squeezer:latest" \
+    sh -lc "ERL_LIBS=/app/_build/dev/lib elixir -e 'Application.ensure_all_started(:moya_squeezer); case MoyaSqueezer.Config.from_toml_file(\"${effective_rel}\") do {:ok, _config} -> :ok; {:error, reason} -> IO.puts(\"failed to parse config: #{inspect(reason)}\"); System.halt(1) end'" >/dev/null
+}
+
+stream_manager_logs() {
+  local manager_name="$1"
+  local log_file="$2"
+
+  docker logs -f "$manager_name" 2>&1 | tee "$log_file" || true
+}
+
+wait_for_manager_success() {
+  local manager_name="$1"
+  local exit_code
+
+  exit_code="$(docker wait "$manager_name")"
+  if [[ "$exit_code" != "0" ]]; then
+    echo "[compound] manager phase failed for ${manager_name} with exit code ${exit_code}"
+    return 1
+  fi
+}
+
+follow_phase() {
+  local phase_name="$1"
+  local manager_name="$2"
+  local log_file="$3"
+
+  echo "[compound] running ${phase_name} phase"
+  stream_manager_logs "$manager_name" "$log_file"
+  wait_for_manager_success "$manager_name"
+  echo "[compound] ${phase_name} phase complete"
 }
 
 generate_effective_squeeze_config() {
@@ -199,6 +270,7 @@ start_manager_for_config() {
   [[ -z "$cookie" ]] && cookie="squeeze_cookie"
 
   generate_effective_squeeze_config "$harness_config" "$effective_full"
+  validate_effective_squeeze_config "$effective_rel"
 
   typeset -a worker_nodes
   while IFS= read -r worker; do
@@ -227,27 +299,33 @@ start_manager_for_config() {
     "moya_squeezer:latest" \
     sh -lc "ERL_LIBS=/app/_build/dev/lib elixir --sname ${manager_name} --cookie ${cookie} -e 'Application.ensure_all_started(:moya_squeezer); case MoyaSqueezer.run(\"${effective_rel}\", worker_nodes: [${worker_node_list}]) do :ok -> :ok; {:error, reason} -> IO.puts(reason); System.halt(1) end'" >/dev/null
 
-  docker logs -f "$manager_name" 2>&1 | tee "$log_file"
-  docker wait "$manager_name" >/dev/null
+  follow_phase "$(basename "$harness_config" .toml)" "$manager_name" "$log_file"
 }
 
 echo "[compound] bringing up cluster + rps phase"
-zsh "${HARNESS_ROOT}/scripts/run_cluster.sh" --config "$RPS_CONFIG" --feel-the-burn 10 --no-follow-report "$@"
+HARNESS_DEFER_RESULTS="1" HARNESS_RUN_NAME="run_compound.sh" zsh "${HARNESS_ROOT}/scripts/run_cluster.sh" --config "$RPS_CONFIG" --feel-the-burn 10 --no-follow-report "$@"
 
 echo "[compound] waiting for rps phase to finish"
 rps_log="${COMPOUND_LOG_DIR}/rps.log"
 concurrency_log="${COMPOUND_LOG_DIR}/concurrency.log"
 payload_log="${COMPOUND_LOG_DIR}/payload.log"
 
-docker logs -f manager 2>&1 | tee "$rps_log"
-docker wait manager >/dev/null
+follow_phase "rps" "manager" "$rps_log"
 
+echo "[compound] transitioning to concurrency phase"
 start_manager_for_config "$CONCURRENCY_CONFIG" "config/generated/docker.compound.concurrency.effective.toml" "$concurrency_log"
+echo "[compound] transitioning to payload phase"
 start_manager_for_config "$PAYLOAD_CONFIG" "config/generated/docker.compound.payload.effective.toml" "$payload_log"
 
 top_rps="$(extract_top_rps "$rps_log")"
 top_concurrency="$(extract_top_concurrency "$concurrency_log")"
 top_payload="$(extract_top_payload "$payload_log")"
 
+write_results_header "$RESULTS_FILE" "run_compound.sh" "$RUN_TIMESTAMP"
+append_phase_results "$RESULTS_FILE" "rps" "$rps_log"
+append_phase_results "$RESULTS_FILE" "concurrency" "$concurrency_log"
+append_phase_results "$RESULTS_FILE" "payload" "$payload_log"
+
 echo "[compound] completed all phases: rps -> concurrency -> payload"
 echo "[compound][summary] top_rps=${top_rps} top_concurrency=${top_concurrency} top_payload_bytes=${top_payload}"
+echo "[compound] wrote results summary: ${RESULTS_FILE}"

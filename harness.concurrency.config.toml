@@ -35,4 +35,5 @@ error_breach_consecutive_windows = 5
 duration_seconds = 60
 warmup_seconds = 10
 worker_inflight_limit = 25
+feel_the_burn_seconds=10
 

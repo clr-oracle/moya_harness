@@ -5,4 +5,4 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${(%):-%N}")" && pwd)"
 HARNESS_ROOT="${HARNESS_ROOT:-$(cd -- "${SCRIPT_DIR}/.." && pwd)}"
 
-"${HARNESS_ROOT}/scripts/run_cluster.sh" --config "${HARNESS_ROOT}/harness.rps.config.toml" "$@"
+HARNESS_RUN_NAME="run_rps.sh" "${HARNESS_ROOT}/scripts/run_cluster.sh" --config "${HARNESS_ROOT}/harness.rps.config.toml" "$@"

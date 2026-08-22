@@ -5,6 +5,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${(%):-%N}")" && pwd)"
 HARNESS_ROOT="${HARNESS_ROOT:-$(cd -- "${SCRIPT_DIR}/.." && pwd)}"
 WORKSPACE_ROOT="$(cd -- "${HARNESS_ROOT}/.." && pwd)"
+source "${HARNESS_ROOT}/scripts/results_helpers.sh"
+
 SQUEEZER_REPO="${SQUEEZER_REPO:-${WORKSPACE_ROOT}/moya_squeezer}"
 DB_REPO="${DB_REPO:-${WORKSPACE_ROOT}/moya_db}"
 DB_BALANCER_REPO="${DB_BALANCER_REPO:-${WORKSPACE_ROOT}/moya_db_balancer}"
@@ -36,7 +38,13 @@ WARMUP_SECONDS="${WARMUP_SECONDS:-}"
 FEEL_THE_BURN_SECONDS="${FEEL_THE_BURN_SECONDS:-}"
 PAYLOAD_STEP_BYTES="${PAYLOAD_STEP_BYTES:-}"
 FOLLOW_MANAGER_REPORT="${FOLLOW_MANAGER_REPORT:-1}"
+HARNESS_DEFER_RESULTS="${HARNESS_DEFER_RESULTS:-0}"
+HARNESS_RUN_NAME="${HARNESS_RUN_NAME:-run_cluster.sh}"
 typeset -A SQUEEZE_OVERRIDES
+
+RUN_TIMESTAMP="$(results_timestamp)"
+RESULTS_FILE="$(results_file_path "$HARNESS_ROOT" "$RUN_TIMESTAMP")"
+MANAGER_RUN_LOG="${HARNESS_ROOT}/logs/${HARNESS_RUN_NAME%.sh}-${RUN_TIMESTAMP}.manager.log"
 
 # First pass for --config so file-based defaults can be loaded from a custom path.
 typeset -a ORIGINAL_ARGS
@@ -660,5 +668,24 @@ echo "[harness] stop with: ${HARNESS_ROOT}/scripts/stop_cluster.sh"
 
 if [[ "${FOLLOW_MANAGER_REPORT}" == "1" ]]; then
   echo "[harness] streaming manager output until manager exits..."
-  docker logs -f "${MANAGER_NAME}" 2>&1
+  docker logs -f "${MANAGER_NAME}" 2>&1 | tee "${MANAGER_RUN_LOG}"
+  manager_exit_code="$(docker wait "${MANAGER_NAME}")"
+
+  write_results_header "${RESULTS_FILE}" "${HARNESS_RUN_NAME}" "${RUN_TIMESTAMP}"
+  echo "manager_exit_code=${manager_exit_code}" >> "${RESULTS_FILE}"
+  echo >> "${RESULTS_FILE}"
+  append_phase_results "${RESULTS_FILE}" "run" "${MANAGER_RUN_LOG}"
+  echo "[harness] wrote results summary: ${RESULTS_FILE}"
+elif [[ "${HARNESS_DEFER_RESULTS}" != "1" ]]; then
+  (
+    manager_exit_code="$(docker wait "${MANAGER_NAME}")"
+    docker logs "${MANAGER_NAME}" > "${MANAGER_RUN_LOG}" 2>&1 || true
+
+    write_results_header "${RESULTS_FILE}" "${HARNESS_RUN_NAME}" "${RUN_TIMESTAMP}"
+    echo "manager_exit_code=${manager_exit_code}" >> "${RESULTS_FILE}"
+    echo >> "${RESULTS_FILE}"
+    append_phase_results "${RESULTS_FILE}" "run" "${MANAGER_RUN_LOG}"
+  ) >/dev/null 2>&1 &
+
+  echo "[harness] results summary will be written after manager exits: ${RESULTS_FILE}"
 fi
